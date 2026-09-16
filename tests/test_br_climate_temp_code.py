@@ -31,6 +31,7 @@ def _payload(options: ClimateRequestOptions) -> dict:
     token = MagicMock()
     token.device_id = "test-device"
     with (
+        patch.object(api, "ensure_device_language", return_value=False),
         patch.object(api, "_ensure_control_token", return_value="control-token"),
         patch.object(api, "_get_authenticated_headers", return_value={}),
     ):

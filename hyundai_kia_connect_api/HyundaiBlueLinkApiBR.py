@@ -32,6 +32,10 @@ from .Vehicle import DayTripCounts, DayTripInfo, MonthTripInfo, TripInfo, Vehicl
 
 _LOGGER = logging.getLogger(__name__)
 
+_BRAZIL_HTTP_LANGUAGE = "pt-BR"
+_BRAZIL_DEVICE_LANGUAGE = "BR-PT"
+_BRAZIL_LANGUAGE_ALIASES = frozenset({"pt", "pt-br", "br-pt"})
+
 # The Brazilian signin endpoint returns {"step": N} (HTTP 200, no redirectUrl)
 # when the account must complete an action in the Bluelink app / web portal
 # before OAuth can proceed. The step numbers map to the routes handled by
@@ -65,6 +69,15 @@ class HyundaiBlueLinkApiBR(ApiImplType1):
     supports_valet_mode: bool = False
     data_timezone = dt.timezone(dt.timedelta(hours=-3))  # Brazil (BRT/BRST)
 
+    @staticmethod
+    def _normalize_language(language: str | None) -> str:
+        normalized = (
+            (language or _BRAZIL_HTTP_LANGUAGE).strip().lower().replace("_", "-")
+        )
+        if normalized not in _BRAZIL_LANGUAGE_ALIASES:
+            raise APIError("Unsupported Brazilian Hyundai language.")
+        return _BRAZIL_HTTP_LANGUAGE
+
     def __init__(self, region: int, brand: int, language: str = "pt-BR"):
         if BRANDS[brand] != BRAND_HYUNDAI:
             raise APIError(
@@ -72,7 +85,8 @@ class HyundaiBlueLinkApiBR(ApiImplType1):
                 "Only Hyundai is supported."
             )
 
-        self.language = language
+        self.language = self._normalize_language(language)
+        self.device_language = _BRAZIL_DEVICE_LANGUAGE
         self.base_url = "br-ccapi.hyundai.com.br"
         self.api_url = f"https://{self.base_url}/api/v1/"
         self.api_v2_url = f"https://{self.base_url}/api/v2/"
@@ -89,7 +103,7 @@ class HyundaiBlueLinkApiBR(ApiImplType1):
             "Content-Type": "application/json; charset=UTF-8",
             "Accept": "application/json, text/plain, */*",
             "Accept-Encoding": "br;q=1.0, gzip;q=0.9, deflate;q=0.8",
-            "Accept-Language": "pt-BR;q=1.0, en-US;q=0.9",
+            "Accept-Language": f"{self.language};q=1.0, en-US;q=0.9",
             "User-Agent": "BR_BlueLink/1.0.14 (com.hyundai.bluelink.br; build:10132; iOS 18.4.0) Alamofire/5.9.1",
             "Host": self.base_url,
             "offset": "-3",
@@ -123,6 +137,7 @@ class HyundaiBlueLinkApiBR(ApiImplType1):
         url = self._build_api_url("/spa/notifications/register")
         headers = {
             "Accept": "application/json",
+            "Accept-Language": self.language,
             "Content-Type": "application/json; charset=UTF-8",
             "User-Agent": "okhttp/4.12.0",
             "ccsp-service-id": self.ccsp_service_id,
@@ -183,6 +198,73 @@ class HyundaiBlueLinkApiBR(ApiImplType1):
         headers["ccsp-application-id"] = self.ccsp_application_id
         headers["Authorization"] = f"Bearer {token.access_token}"
         return headers
+
+    @staticmethod
+    def _read_language_response(
+        response: Response, *, require_language: bool
+    ) -> str | None:
+        """Validate a device-language response without exposing its body."""
+        if response.status_code >= 400:
+            raise APIError(
+                "Brazilian Hyundai device-language request failed "
+                f"with HTTP {response.status_code}."
+            )
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise APIError(
+                "Brazilian Hyundai device-language request returned invalid JSON."
+            ) from exc
+        if not isinstance(data, dict):
+            raise APIError(
+                "Brazilian Hyundai device-language request returned an invalid response."
+            )
+        if data.get("retCode") != "S" or data.get("resCode") != "0000":
+            raise APIError("Brazilian Hyundai device-language request was rejected.")
+
+        response_message = data.get("resMsg")
+        current_language = (
+            response_message.get("language")
+            if isinstance(response_message, dict)
+            else None
+        )
+        if require_language and (
+            not isinstance(current_language, str) or not current_language.strip()
+        ):
+            raise APIError(
+                "Brazilian Hyundai device-language response omitted the language."
+            )
+        return current_language if isinstance(current_language, str) else None
+
+    def ensure_device_language(self, token: Token) -> bool:
+        """Ensure the registered BR device uses Brazilian Portuguese.
+
+        Returns ``True`` only when the server-side setting needed an update.
+        The operation is idempotent and never retries automatically.
+        """
+        device_id = token.device_id or self.ccsp_device_id
+        if not isinstance(device_id, str) or not device_id:
+            raise APIError(
+                "Brazilian Hyundai device-language sync requires a device ID."
+            )
+
+        url = self._build_api_url(f"/spa/devices/{device_id}/setting/language")
+        headers = self._get_authenticated_headers(token)
+        current_response = self.session.get(url, headers=headers)
+        current_language = self._read_language_response(
+            current_response, require_language=True
+        )
+        normalized_current = current_language.strip().lower().replace("_", "-")
+        if normalized_current in _BRAZIL_LANGUAGE_ALIASES:
+            return False
+
+        update_response = self.session.post(
+            url,
+            json={"language": self.device_language},
+            headers=headers,
+        )
+        self._read_language_response(update_response, require_language=False)
+        return True
 
     def _raise_auth_error(self, response: Response, context: str) -> None:
         """Surface a readable auth error for non-2xx BR auth responses.
@@ -329,7 +411,7 @@ class HyundaiBlueLinkApiBR(ApiImplType1):
         expires_in_seconds = auth_response["expires_in"]
         expires_at = dt.datetime.now(dt.UTC) + timedelta(seconds=expires_in_seconds)
 
-        return Token(
+        token = Token(
             access_token=auth_response["access_token"],
             refresh_token=auth_response["refresh_token"],
             valid_until=expires_at,
@@ -338,6 +420,16 @@ class HyundaiBlueLinkApiBR(ApiImplType1):
             device_id=device_id,
             pin=pin,
         )
+        try:
+            self.ensure_device_language(token)
+        except APIError:
+            # Language must never make read-only access unavailable. Remote
+            # commands call ensure_device_language again and fail closed.
+            _LOGGER.warning(
+                "%s - language_sync_failed stage=login status=provider_error",
+                DOMAIN,
+            )
+        return token
 
     def get_vehicles(self, token: Token) -> list:
         """Get list of vehicles."""
@@ -476,6 +568,7 @@ class HyundaiBlueLinkApiBR(ApiImplType1):
         self, token: Token, vehicle: Vehicle, action: VEHICLE_LOCK_ACTION
     ) -> str:
         """Lock or unlock the vehicle."""
+        self.ensure_device_language(token)
         control_token = self._ensure_control_token(token)
         device_id = token.device_id or self.ccsp_device_id
 
@@ -488,12 +581,12 @@ class HyundaiBlueLinkApiBR(ApiImplType1):
         headers["ccuCCS2ProtocolSupport"] = str(vehicle.ccu_ccs2_protocol_support or 0)
 
         payload = {"deviceId": device_id, "action": action.value}
-        _LOGGER.debug(f"{DOMAIN} - Lock action request: %s", payload)
+        _LOGGER.debug("%s - Lock action request prepared: %s", DOMAIN, action.value)
 
         response = self.session.post(url, json=payload, headers=headers)
         response.raise_for_status()
         data = response.json()
-        _LOGGER.debug(f"{DOMAIN} - Lock action response: %s", data)
+        _LOGGER.debug("%s - Lock action response received", DOMAIN)
 
         if data.get("retCode") != "S":
             raise APIError(
@@ -556,6 +649,7 @@ class HyundaiBlueLinkApiBR(ApiImplType1):
         self, token: Token, vehicle: Vehicle, options: WindowRequestOptions
     ) -> str:
         """Open or close all windows (BR API controls all windows together)."""
+        self.ensure_device_language(token)
         control_token = self._ensure_control_token(token)
         device_id = token.device_id or self.ccsp_device_id
 
@@ -578,12 +672,12 @@ class HyundaiBlueLinkApiBR(ApiImplType1):
         headers["ccuCCS2ProtocolSupport"] = str(vehicle.ccu_ccs2_protocol_support or 0)
 
         payload = {"action": action, "deviceId": device_id}
-        _LOGGER.debug(f"{DOMAIN} - Window action request: {payload}")
+        _LOGGER.debug("%s - Window action request prepared: %s", DOMAIN, action)
 
         response = self.session.post(url, json=payload, headers=headers)
         response.raise_for_status()
         data = response.json()
-        _LOGGER.debug(f"{DOMAIN} - Window action response: {data}")
+        _LOGGER.debug("%s - Window action response received", DOMAIN)
 
         if data.get("retCode") != "S":
             raise APIError(
@@ -594,6 +688,7 @@ class HyundaiBlueLinkApiBR(ApiImplType1):
 
     def start_hazard_lights(self, token: Token, vehicle: Vehicle) -> str:
         """Turn on hazard lights (lights only, no horn)."""
+        self.ensure_device_language(token)
         control_token = self._ensure_control_token(token)
         device_id = token.device_id or self.ccsp_device_id
 
@@ -608,7 +703,7 @@ class HyundaiBlueLinkApiBR(ApiImplType1):
         response = self.session.post(url, headers=headers)
         response.raise_for_status()
         data = response.json()
-        _LOGGER.debug(f"{DOMAIN} - Hazard lights response: {data}")
+        _LOGGER.debug("%s - Hazard lights response received", DOMAIN)
 
         if data.get("retCode") != "S":
             raise APIError(
@@ -633,6 +728,7 @@ class HyundaiBlueLinkApiBR(ApiImplType1):
         self, token: Token, vehicle: Vehicle, options: ClimateRequestOptions
     ) -> str:
         """Start climate control with temperature and seat heating settings."""
+        self.ensure_device_language(token)
         control_token = self._ensure_control_token(token)
         device_id = token.device_id or self.ccsp_device_id
 
@@ -689,12 +785,12 @@ class HyundaiBlueLinkApiBR(ApiImplType1):
             "unit": "C",
         }
 
-        _LOGGER.debug(f"{DOMAIN} - Start climate request: {payload}")
+        _LOGGER.debug("%s - Start climate request prepared", DOMAIN)
 
         response = self.session.post(url, json=payload, headers=headers)
         response.raise_for_status()
         data = response.json()
-        _LOGGER.debug(f"{DOMAIN} - Start climate response: {data}")
+        _LOGGER.debug("%s - Start climate response received", DOMAIN)
 
         if data.get("retCode") != "S":
             raise APIError(
@@ -705,6 +801,7 @@ class HyundaiBlueLinkApiBR(ApiImplType1):
 
     def stop_climate(self, token: Token, vehicle: Vehicle) -> str:
         """Stop climate control."""
+        self.ensure_device_language(token)
         control_token = self._ensure_control_token(token)
         device_id = token.device_id or self.ccsp_device_id
 
@@ -717,12 +814,12 @@ class HyundaiBlueLinkApiBR(ApiImplType1):
 
         payload = {"action": "stop", "deviceId": device_id}
 
-        _LOGGER.debug(f"{DOMAIN} - Stop climate request: {payload}")
+        _LOGGER.debug("%s - Stop climate request prepared", DOMAIN)
 
         response = self.session.post(url, json=payload, headers=headers)
         response.raise_for_status()
         data = response.json()
-        _LOGGER.debug(f"{DOMAIN} - Stop climate response: {data}")
+        _LOGGER.debug("%s - Stop climate response received", DOMAIN)
 
         if data.get("retCode") != "S":
             raise APIError(

@@ -15,7 +15,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from hyundai_kia_connect_api.const import BRAND_HYUNDAI, BRANDS, REGION_BRAZIL, REGIONS
+from hyundai_kia_connect_api.const import (
+    BRAND_HYUNDAI,
+    BRANDS,
+    REGION_BRAZIL,
+    REGIONS,
+    VEHICLE_LOCK_ACTION,
+)
 from hyundai_kia_connect_api.exceptions import APIError, AuthenticationError
 from hyundai_kia_connect_api.HyundaiBlueLinkApiBR import HyundaiBlueLinkApiBR
 
@@ -37,6 +43,32 @@ def _resp(status_code: int, json_data: dict | None = None, text: str = "") -> Ma
 @pytest.fixture
 def br_api() -> HyundaiBlueLinkApiBR:
     return HyundaiBlueLinkApiBR(region=_BR_REGION, brand=_HYUNDAI_BRAND)
+
+
+def _token(device_id: str = "registered-device") -> MagicMock:
+    return MagicMock(device_id=device_id, access_token="access-token", pin="1234")
+
+
+class TestBrazilianLanguageNormalization:
+    @pytest.mark.parametrize("language", ["pt", "pt-BR", "pt_BR", "BR-PT"])
+    def test_accepts_portuguese_aliases(self, language):
+        api = HyundaiBlueLinkApiBR(
+            region=_BR_REGION,
+            brand=_HYUNDAI_BRAND,
+            language=language,
+        )
+
+        assert api.language == "pt-BR"
+        assert api.device_language == "BR-PT"
+        assert api.api_headers["Accept-Language"].startswith("pt-BR;")
+
+    def test_rejects_unsupported_language(self):
+        with pytest.raises(APIError, match="Unsupported Brazilian Hyundai language"):
+            HyundaiBlueLinkApiBR(
+                region=_BR_REGION,
+                brand=_HYUNDAI_BRAND,
+                language="en",
+            )
 
 
 class TestRaiseAuthError:
@@ -153,6 +185,7 @@ class TestDeviceRegistration:
         assert url.endswith("/api/v1/spa/notifications/register")
         assert request["headers"] == {
             "Accept": "application/json",
+            "Accept-Language": "pt-BR",
             "Content-Type": "application/json; charset=UTF-8",
             "User-Agent": "okhttp/4.12.0",
             "ccsp-service-id": "03f7df9b-7626-4853-b7bd-ad1e8d722bd5",
@@ -211,8 +244,145 @@ class TestDeviceRegistration:
                 "expires_in": 3600,
             }
         )
+        br_api.ensure_device_language = MagicMock(return_value=False)
 
         token = br_api.login("user@example.com", "password", pin="1234")
 
         assert token.device_id == "registered-device"
         br_api._get_device_id.assert_called_once_with()
+        br_api.ensure_device_language.assert_called_once_with(token)
+
+
+class TestDeviceLanguage:
+    def test_already_portuguese_is_idempotent(self, br_api):
+        br_api.session = MagicMock()
+        br_api.session.get.return_value = _resp(
+            200,
+            {
+                "retCode": "S",
+                "resCode": "0000",
+                "resMsg": {"language": "BR-PT"},
+            },
+        )
+
+        assert br_api.ensure_device_language(_token()) is False
+        br_api.session.post.assert_not_called()
+        request = br_api.session.get.call_args.kwargs
+        assert request["headers"]["Accept-Language"].startswith("pt-BR;")
+        assert request["headers"]["ccsp-device-id"] == "registered-device"
+
+    def test_updates_non_portuguese_device(self, br_api):
+        br_api.session = MagicMock()
+        br_api.session.get.return_value = _resp(
+            200,
+            {
+                "retCode": "S",
+                "resCode": "0000",
+                "resMsg": {"language": "BR-EN"},
+            },
+        )
+        br_api.session.post.return_value = _resp(
+            200,
+            {"retCode": "S", "resCode": "0000", "resMsg": {}},
+        )
+
+        assert br_api.ensure_device_language(_token()) is True
+        (url,) = br_api.session.post.call_args.args
+        request = br_api.session.post.call_args.kwargs
+        assert url.endswith("/api/v1/spa/devices/registered-device/setting/language")
+        assert request["json"] == {"language": "BR-PT"}
+
+    @pytest.mark.parametrize(
+        ("response", "message"),
+        [
+            (_resp(503, {"retCode": "F"}), "HTTP 503"),
+            (
+                _resp(200, {"retCode": "F", "resCode": "secret-code"}),
+                "was rejected",
+            ),
+            (
+                _resp(200, {"retCode": "S", "resCode": "0000", "resMsg": {}}),
+                "omitted the language",
+            ),
+            (_resp(200, None), "invalid JSON"),
+        ],
+    )
+    def test_rejects_invalid_language_responses_without_body_details(
+        self, br_api, response, message
+    ):
+        br_api.session = MagicMock()
+        br_api.session.get.return_value = response
+
+        with pytest.raises(APIError, match=message) as caught:
+            br_api.ensure_device_language(_token())
+
+        assert "secret-code" not in str(caught.value)
+        br_api.session.post.assert_not_called()
+
+    def test_login_language_failure_does_not_block_read_session(self, br_api, caplog):
+        br_api._get_device_id = MagicMock(return_value="registered-device")
+        br_api._get_cookies = MagicMock(return_value={})
+        br_api._get_authorization_code = MagicMock(return_value="authorization-code")
+        br_api._get_auth_response = MagicMock(
+            return_value={
+                "access_token": "access-token",
+                "refresh_token": "refresh-token",
+                "expires_in": 3600,
+            }
+        )
+        br_api.ensure_device_language = MagicMock(
+            side_effect=APIError("provider token=secret")
+        )
+
+        token = br_api.login("user@example.com", "password", pin="1234")
+
+        assert token.device_id == "registered-device"
+        assert "language_sync_failed" in caplog.text
+        assert "secret" not in caplog.text
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            pytest.param(
+                lambda api, token, vehicle: api.lock_action(
+                    token, vehicle, VEHICLE_LOCK_ACTION.LOCK
+                ),
+                id="lock",
+            ),
+            pytest.param(
+                lambda api, token, vehicle: api.set_windows_state(
+                    token, vehicle, MagicMock()
+                ),
+                id="windows",
+            ),
+            pytest.param(
+                lambda api, token, vehicle: api.start_hazard_lights(token, vehicle),
+                id="hazard",
+            ),
+            pytest.param(
+                lambda api, token, vehicle: api.start_climate(
+                    token, vehicle, MagicMock()
+                ),
+                id="start-climate",
+            ),
+            pytest.param(
+                lambda api, token, vehicle: api.stop_climate(token, vehicle),
+                id="stop-climate",
+            ),
+        ],
+    )
+    def test_commands_fail_closed_before_control_token_or_vehicle_request(
+        self, br_api, command
+    ):
+        br_api.session = MagicMock()
+        br_api.ensure_device_language = MagicMock(
+            side_effect=APIError("device-language unavailable")
+        )
+        br_api._ensure_control_token = MagicMock()
+        vehicle = MagicMock(id="vehicle-id", ccu_ccs2_protocol_support=0)
+
+        with pytest.raises(APIError, match="device-language unavailable"):
+            command(br_api, _token(), vehicle)
+
+        br_api._ensure_control_token.assert_not_called()
+        br_api.session.post.assert_not_called()
