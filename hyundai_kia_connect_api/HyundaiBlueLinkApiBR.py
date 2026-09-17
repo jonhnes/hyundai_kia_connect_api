@@ -2,6 +2,8 @@
 
 # pylint:disable=logging-fstring-interpolation,invalid-name,broad-exception-caught,unused-argument,missing-function-docstring,line-too-long
 
+import base64
+import binascii
 import datetime as dt
 import logging
 import re
@@ -12,9 +14,15 @@ from datetime import timedelta
 from time import sleep
 from urllib.parse import parse_qs, urljoin, urlparse
 
+import requests
 from requests import Response
 
-from .ApiImpl import ApiImplSession, ClimateRequestOptions, WindowRequestOptions
+from .ApiImpl import (
+    ApiImplSession,
+    ClimateRequestOptions,
+    SurroundViewCapture,
+    WindowRequestOptions,
+)
 from .ApiImplType1 import ApiImplType1
 from .const import (
     BRAND_HYUNDAI,
@@ -35,6 +43,31 @@ _LOGGER = logging.getLogger(__name__)
 _BRAZIL_HTTP_LANGUAGE = "pt-BR"
 _BRAZIL_DEVICE_LANGUAGE = "BR-PT"
 _BRAZIL_LANGUAGE_ALIASES = frozenset({"pt", "pt-br", "br-pt"})
+_SVM_API_URL = "https://apigw-ccs-h-br.goc-am.hmgmobility.com/"
+_SVM_PENDING_CODE = "5911"
+_SVM_VIDEO_FIELDS = {
+    "top": "svmVideoTop",
+    "front": "svmVideoFront",
+    "rear": "svmVideoRear",
+    "right": "svmVideoRight",
+    "left": "svmVideoLeft",
+}
+_SVM_METADATA_FIELDS = (
+    "imageSize",
+    "boundaryArea",
+    "installAngle",
+    "validAngleofView",
+    "doorOpen",
+    "sidemirrorOpen",
+    "trunkOpen",
+)
+_SVM_ERROR_MESSAGES = {
+    "4292": "Brazilian Hyundai surround-view request was rate limited.",
+    "7779": "Brazilian Hyundai surround-view vehicle was unavailable.",
+    "7780": "Brazilian Hyundai surround-view camera was unavailable.",
+    "7781": "Brazilian Hyundai surround-view is unavailable while hazard lights are on.",
+    "7782": "Brazilian Hyundai surround-view is unavailable because the vehicle battery is low.",
+}
 
 # The Brazilian signin endpoint returns {"step": N} (HTTP 200, no redirectUrl)
 # when the account must complete an action in the Bluelink app / web portal
@@ -90,6 +123,7 @@ class HyundaiBlueLinkApiBR(ApiImplType1):
         self.base_url = "br-ccapi.hyundai.com.br"
         self.api_url = f"https://{self.base_url}/api/v1/"
         self.api_v2_url = f"https://{self.base_url}/api/v2/"
+        self.svm_api_url = _SVM_API_URL
         self.ccsp_device_id: str | None = None
         self._registration_uuid = str(uuid.uuid4())
         self.ccsp_service_id = "03f7df9b-7626-4853-b7bd-ad1e8d722bd5"
@@ -120,6 +154,10 @@ class HyundaiBlueLinkApiBR(ApiImplType1):
     def _build_api_v2_url(self, path: str) -> str:
         """Build API v2 URL from path."""
         return urljoin(self.api_v2_url, path.lstrip("/"))
+
+    def _build_svm_api_url(self, path: str) -> str:
+        """Build a SVM URL on the host used by the current BR mobile app."""
+        return urljoin(self.svm_api_url, path.lstrip("/"))
 
     def _get_device_id(self, stamp: str | None = None) -> str:
         """Register and cache a Brazilian Bluelink device identifier.
@@ -563,6 +601,208 @@ class HyundaiBlueLinkApiBR(ApiImplType1):
         token.control_token = control_token
         token.control_token_expires_at = expires_at
         return control_token
+
+    def _get_svm_authenticated_headers(self, token: Token, vehicle: Vehicle) -> dict:
+        """Return the app-equivalent headers for the dedicated SVM host.
+
+        The currently observed Android SVM interceptor authenticates with the
+        OAuth access token. A control token is still obtained before the
+        operation as a local PIN gate, but is deliberately not substituted for
+        ``Authorization`` here: it was not part of the observed SVM contract.
+        """
+        headers = self._get_authenticated_headers(token)
+        headers["Host"] = urlparse(self.svm_api_url).netloc
+        headers["ccsp-service-id"] = self.ccsp_service_id
+        ccs2_support = getattr(vehicle, "ccu_ccs2_protocol_support", 0) or 0
+        headers["ccuCCS2ProtocolSupport"] = str(ccs2_support)
+        return headers
+
+    @staticmethod
+    def _read_svm_payload(response: Response, *, stage: str) -> dict:
+        """Validate a SVM HTTP response without including its body in errors."""
+        if response.status_code >= 400:
+            raise APIError(
+                f"Brazilian Hyundai surround-view {stage} failed with HTTP "
+                f"{response.status_code}."
+            )
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise APIError(
+                f"Brazilian Hyundai surround-view {stage} returned invalid JSON."
+            ) from exc
+        if not isinstance(payload, dict):
+            raise APIError(
+                f"Brazilian Hyundai surround-view {stage} returned an invalid response."
+            )
+        return payload
+
+    @staticmethod
+    def _raise_for_svm_provider_error(payload: dict) -> None:
+        """Raise a sanitized error for a non-pending SVM provider result."""
+        result_code = str(payload.get("resCode") or "")
+        if result_code == _SVM_PENDING_CODE:
+            return
+        if payload.get("retCode") == "F":
+            raise APIError(
+                _SVM_ERROR_MESSAGES.get(
+                    result_code,
+                    "Brazilian Hyundai surround-view request was rejected "
+                    f"(resCode={result_code or 'unknown'}).",
+                )
+            )
+        if payload.get("retCode") not in (None, "S"):
+            raise APIError("Brazilian Hyundai surround-view returned an unknown status.")
+
+    @staticmethod
+    def _decode_svm_base64(value: object, *, field_name: str) -> bytes:
+        """Decode one provider media field without exposing its content."""
+        if not isinstance(value, str) or not value:
+            raise APIError(
+                f"Brazilian Hyundai surround-view omitted {field_name} media."
+            )
+        try:
+            decoded = base64.b64decode(value.encode("ascii"), validate=True)
+        except (UnicodeEncodeError, ValueError, binascii.Error) as exc:
+            raise APIError(
+                f"Brazilian Hyundai surround-view returned invalid {field_name} media."
+            ) from exc
+        if not decoded:
+            raise APIError(
+                f"Brazilian Hyundai surround-view returned empty {field_name} media."
+            )
+        return decoded
+
+    @staticmethod
+    def _svm_result_containers(payload: dict) -> tuple[dict, dict]:
+        """Return the SVM result and its optional image-detail object."""
+        result = payload.get("resMsg")
+        if not isinstance(result, dict):
+            raise APIError("Brazilian Hyundai surround-view result omitted resMsg.")
+        detail = result.get("scsDetail")
+        return result, detail if isinstance(detail, dict) else result
+
+    @staticmethod
+    def _svm_metadata(result: dict, detail: dict) -> dict[str, object]:
+        """Keep only non-location SVM metadata for callers and diagnostics."""
+        metadata: dict[str, object] = {}
+        for field_name in _SVM_METADATA_FIELDS:
+            if field_name in detail:
+                metadata[field_name] = detail[field_name]
+            elif field_name in result:
+                metadata[field_name] = result[field_name]
+        return metadata
+
+    def _parse_svm_capture(
+        self, payload: dict, message_id: str
+    ) -> SurroundViewCapture:
+        """Convert a completed SVM response into one strictly typed result."""
+        self._raise_for_svm_provider_error(payload)
+        result, detail = self._svm_result_containers(payload)
+        image_value = detail.get("svmImage")
+        if image_value is None and detail is not result:
+            image_value = result.get("svmImage")
+
+        video_values: dict[str, object] = {}
+        for direction, field_name in _SVM_VIDEO_FIELDS.items():
+            value = detail.get(field_name)
+            if value is None and detail is not result:
+                value = result.get(field_name)
+            if value is not None:
+                video_values[direction] = value
+
+        if image_value is not None and video_values:
+            raise APIError(
+                "Brazilian Hyundai surround-view returned mixed image and video media."
+            )
+        if image_value is not None:
+            return SurroundViewCapture(
+                message_id=message_id,
+                media_type="image",
+                image=self._decode_svm_base64(image_value, field_name="image"),
+                metadata=self._svm_metadata(result, detail),
+            )
+        if video_values:
+            if set(video_values) != set(_SVM_VIDEO_FIELDS):
+                raise APIError(
+                    "Brazilian Hyundai surround-view returned incomplete video media."
+                )
+            return SurroundViewCapture(
+                message_id=message_id,
+                media_type="video",
+                videos={
+                    direction: self._decode_svm_base64(value, field_name="video")
+                    for direction, value in video_values.items()
+                },
+                metadata=self._svm_metadata(result, detail),
+            )
+        raise APIError("Brazilian Hyundai surround-view result did not contain media.")
+
+    def capture_surround_view(
+        self,
+        token: Token,
+        vehicle: Vehicle,
+        *,
+        poll_seconds: float = 5,
+        timeout_seconds: float = 145,
+    ) -> SurroundViewCapture:
+        """Request one SVM capture and poll its existing ``msgId`` only.
+
+        The POST has a physical effect: on supported vehicles it can unfold the
+        mirrors and use the surround cameras. It is submitted at most once.
+        No request body or mode parameter is sent because the observed mobile
+        contract exposes neither.
+        """
+        if poll_seconds <= 0:
+            raise ValueError("poll_seconds must be greater than zero.")
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be greater than zero.")
+
+        # Keep the existing BR mutable-operation safeguards. The token is a
+        # PIN gate only; SVM's observed Authorization remains the access token.
+        self.ensure_device_language(token)
+        self._ensure_control_token(token)
+
+        url = self._build_svm_api_url(
+            f"/api/v1/spa/vehicles/{vehicle.id}/svm/async"
+        )
+        headers = self._get_svm_authenticated_headers(token, vehicle)
+        try:
+            response = self.session.post(url, headers=headers)
+        except (APIError, requests.RequestException) as exc:
+            raise APIError(
+                "Brazilian Hyundai surround-view submission outcome is unknown; "
+                "do not retry automatically."
+            ) from exc
+        submission = self._read_svm_payload(response, stage="submission")
+        self._raise_for_svm_provider_error(submission)
+        message_id = submission.get("msgId")
+        if not isinstance(message_id, str) or not message_id:
+            raise APIError(
+                "Brazilian Hyundai surround-view submission did not return a msgId."
+            )
+
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            try:
+                response = self.session.get(
+                    url,
+                    params={"msgId": message_id},
+                    headers=headers,
+                )
+            except (APIError, requests.RequestException) as exc:
+                raise APIError(
+                    "Brazilian Hyundai surround-view polling failed; "
+                    "the capture outcome remains unknown."
+                ) from exc
+            result = self._read_svm_payload(response, stage="polling")
+            if str(result.get("resCode") or "") != _SVM_PENDING_CODE:
+                return self._parse_svm_capture(result, message_id)
+            if time.monotonic() >= deadline:
+                raise APIError(
+                    "Brazilian Hyundai surround-view timed out before media was available."
+                )
+            sleep(poll_seconds)
 
     def lock_action(
         self, token: Token, vehicle: Vehicle, action: VEHICLE_LOCK_ACTION

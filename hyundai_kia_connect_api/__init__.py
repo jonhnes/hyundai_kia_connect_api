@@ -7,6 +7,7 @@ from .ApiImpl import (
     ScheduleChargingClimateRequestOptions,
     POIInfo,
     POICoord,
+    SurroundViewCapture,
 )
 
 from .Token import Token

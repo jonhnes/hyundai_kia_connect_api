@@ -3,7 +3,7 @@
 # pylint:disable=unnecessary-pass,missing-class-docstring,invalid-name,missing-function-docstring,wildcard-import,unused-wildcard-import,unused-argument,logging-fstring-interpolation
 import datetime as dt
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import requests
 from requests.exceptions import JSONDecodeError
@@ -72,6 +72,24 @@ class OTPRequest:
     has_sms: bool | None
     email: str | None
     sms: str | None
+
+
+@dataclass(frozen=True)
+class SurroundViewCapture:
+    """Media returned by a Brazilian surround-view capture.
+
+    ``image`` contains the composite surround-view image when the provider
+    returns a photo. ``videos`` contains the provider's directional clips
+    (``top``, ``front``, ``rear``, ``right`` and ``left``) only when all five
+    video fields are present. The binary fields are deliberately hidden from
+    ``repr`` so callers do not accidentally log camera media.
+    """
+
+    message_id: str
+    media_type: str
+    image: bytes | None = field(default=None, repr=False)
+    videos: dict[str, bytes] = field(default_factory=dict, repr=False)
+    metadata: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -231,6 +249,25 @@ class ApiImpl:
         """Triggers the system to contact the car and get fresh data"""
         raise NotImplementedError(
             "force_refresh_vehicle_state is not implemented for this region"
+        )
+
+    def capture_surround_view(
+        self,
+        token: Token,
+        vehicle: Vehicle,
+        *,
+        poll_seconds: float = 5,
+        timeout_seconds: float = 145,
+    ) -> SurroundViewCapture:
+        """Request one surround-view capture and poll its result.
+
+        This is currently implemented only for the Brazilian Hyundai API.
+        Implementations must not replay the capture request after an ambiguous
+        submission failure because it can operate the vehicle's cameras and
+        mirrors.
+        """
+        raise NotImplementedError(
+            "capture_surround_view is not implemented for this region"
         )
 
     def update_geocoded_location(

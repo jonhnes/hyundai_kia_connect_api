@@ -12,6 +12,7 @@ from .ApiImpl import (
     OTPRequest,
     POIInfo,
     ScheduleChargingClimateRequestOptions,
+    SurroundViewCapture,
     WindowRequestOptions,
 )
 from .const import (
@@ -249,6 +250,21 @@ class VehicleManager:
             self.token,
             self.get_vehicle(vehicle_id),
             VEHICLE_LOCK_ACTION.UNLOCK,
+        )
+
+    def capture_surround_view(
+        self,
+        vehicle_id: str,
+        *,
+        poll_seconds: float = 5,
+        timeout_seconds: float = 145,
+    ) -> SurroundViewCapture:
+        """Request one remote surround-view capture for a supported vehicle."""
+        return self.api.capture_surround_view(
+            self.token,
+            self.get_vehicle(vehicle_id),
+            poll_seconds=poll_seconds,
+            timeout_seconds=timeout_seconds,
         )
 
     def start_charge(self, vehicle_id: str) -> str:
