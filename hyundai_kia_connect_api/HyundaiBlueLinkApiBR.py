@@ -40,9 +40,12 @@ from .Vehicle import DayTripCounts, DayTripInfo, MonthTripInfo, TripInfo, Vehicl
 
 _LOGGER = logging.getLogger(__name__)
 
-_BRAZIL_HTTP_LANGUAGE = "pt-BR"
+_BRAZIL_HTTP_LANGUAGE = "en-US"
 _BRAZIL_DEVICE_LANGUAGE = "BR-PT"
-_BRAZIL_LANGUAGE_ALIASES = frozenset({"pt", "pt-br", "br-pt"})
+_BRAZIL_LANGUAGE_ALIASES = {
+    "en": "en-US", "en-us": "en-US",
+    "pt": "pt-BR", "pt-br": "pt-BR", "br-pt": "pt-BR",
+}
 _SVM_API_URL = "https://apigw-ccs-h-br.goc-am.hmgmobility.com/"
 _SVM_PENDING_CODE = "5911"
 _SVM_VIDEO_FIELDS = {
@@ -109,9 +112,9 @@ class HyundaiBlueLinkApiBR(ApiImplType1):
         )
         if normalized not in _BRAZIL_LANGUAGE_ALIASES:
             raise APIError("Unsupported Brazilian Hyundai language.")
-        return _BRAZIL_HTTP_LANGUAGE
+        return _BRAZIL_LANGUAGE_ALIASES[normalized]
 
-    def __init__(self, region: int, brand: int, language: str = "pt-BR"):
+    def __init__(self, region: int, brand: int, language: str = "en-US"):
         if BRANDS[brand] != BRAND_HYUNDAI:
             raise APIError(
                 f"Unknown brand {BRANDS[brand]} for region Brazil. "
@@ -137,7 +140,7 @@ class HyundaiBlueLinkApiBR(ApiImplType1):
             "Content-Type": "application/json; charset=UTF-8",
             "Accept": "application/json, text/plain, */*",
             "Accept-Encoding": "br;q=1.0, gzip;q=0.9, deflate;q=0.8",
-            "Accept-Language": f"{self.language};q=1.0, en-US;q=0.9",
+            "Accept-Language": self.language,
             "User-Agent": "BR_BlueLink/1.0.14 (com.hyundai.bluelink.br; build:10132; iOS 18.4.0) Alamofire/5.9.1",
             "Host": self.base_url,
             "offset": "-3",
@@ -352,7 +355,7 @@ class HyundaiBlueLinkApiBR(ApiImplType1):
 
         url = self._build_api_url("/user/oauth2/authorize")
         _LOGGER.debug(f"{DOMAIN} - Requesting cookies from {url}")
-        response = self.session.get(url, params=params)
+        response = self.session.get(url, params=params, headers={"Accept-Language": self.language})
         self._raise_auth_error(response, "cookie request")
         # The session cookie ('account') is set during the 302 redirect, so it
         # lives in the session cookie jar rather than on the final response.
@@ -372,7 +375,7 @@ class HyundaiBlueLinkApiBR(ApiImplType1):
             "Connection": "keep-alive",
             "Content-Type": "text/plain;charset=UTF-8",
             "Host": self.api_headers["Host"],
-            "Accept-Language": "pt-BR,en-US;q=0.9,en;q=0.8",
+            "Accept-Language": self.language,
             "Origin": "https://br-ccapi.hyundai.com.br",
             "User-Agent": (
                 "Mozilla/5.0 (iPhone; CPU iPhone OS 18_4 like Mac OS X) "
@@ -423,6 +426,7 @@ class HyundaiBlueLinkApiBR(ApiImplType1):
         }
         headers = {
             "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+            "Accept-Language": self.language,
             "User-Agent": self.api_headers["User-Agent"],
             "Authorization": self.basic_authorization_header,
         }
@@ -458,15 +462,6 @@ class HyundaiBlueLinkApiBR(ApiImplType1):
             device_id=device_id,
             pin=pin,
         )
-        try:
-            self.ensure_device_language(token)
-        except APIError:
-            # Language must never make read-only access unavailable. Remote
-            # commands call ensure_device_language again and fail closed.
-            _LOGGER.warning(
-                "%s - language_sync_failed stage=login status=provider_error",
-                DOMAIN,
-            )
         return token
 
     def get_vehicles(self, token: Token) -> list:
@@ -760,7 +755,6 @@ class HyundaiBlueLinkApiBR(ApiImplType1):
 
         # Keep the existing BR mutable-operation safeguards. The token is a
         # PIN gate only; SVM's observed Authorization remains the access token.
-        self.ensure_device_language(token)
         self._ensure_control_token(token)
 
         url = self._build_svm_api_url(
@@ -808,7 +802,6 @@ class HyundaiBlueLinkApiBR(ApiImplType1):
         self, token: Token, vehicle: Vehicle, action: VEHICLE_LOCK_ACTION
     ) -> str:
         """Lock or unlock the vehicle."""
-        self.ensure_device_language(token)
         control_token = self._ensure_control_token(token)
         device_id = token.device_id or self.ccsp_device_id
 
@@ -889,7 +882,6 @@ class HyundaiBlueLinkApiBR(ApiImplType1):
         self, token: Token, vehicle: Vehicle, options: WindowRequestOptions
     ) -> str:
         """Open or close all windows (BR API controls all windows together)."""
-        self.ensure_device_language(token)
         control_token = self._ensure_control_token(token)
         device_id = token.device_id or self.ccsp_device_id
 
@@ -928,7 +920,6 @@ class HyundaiBlueLinkApiBR(ApiImplType1):
 
     def start_hazard_lights(self, token: Token, vehicle: Vehicle) -> str:
         """Turn on hazard lights (lights only, no horn)."""
-        self.ensure_device_language(token)
         control_token = self._ensure_control_token(token)
         device_id = token.device_id or self.ccsp_device_id
 
@@ -968,7 +959,6 @@ class HyundaiBlueLinkApiBR(ApiImplType1):
         self, token: Token, vehicle: Vehicle, options: ClimateRequestOptions
     ) -> str:
         """Start climate control with temperature and seat heating settings."""
-        self.ensure_device_language(token)
         control_token = self._ensure_control_token(token)
         device_id = token.device_id or self.ccsp_device_id
 
@@ -1041,7 +1031,6 @@ class HyundaiBlueLinkApiBR(ApiImplType1):
 
     def stop_climate(self, token: Token, vehicle: Vehicle) -> str:
         """Stop climate control."""
-        self.ensure_device_language(token)
         control_token = self._ensure_control_token(token)
         device_id = token.device_id or self.ccsp_device_id
 

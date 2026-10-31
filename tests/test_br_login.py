@@ -60,15 +60,35 @@ class TestBrazilianLanguageNormalization:
 
         assert api.language == "pt-BR"
         assert api.device_language == "BR-PT"
-        assert api.api_headers["Accept-Language"].startswith("pt-BR;")
+        assert api.api_headers["Accept-Language"] == "pt-BR"
 
     def test_rejects_unsupported_language(self):
         with pytest.raises(APIError, match="Unsupported Brazilian Hyundai language"):
             HyundaiBlueLinkApiBR(
                 region=_BR_REGION,
                 brand=_HYUNDAI_BRAND,
-                language="en",
+                language="fr",
             )
+
+
+    @pytest.mark.parametrize("language", ["en", "en-US", "en_US"])
+    def test_accepts_english_aliases(self, language):
+        api = HyundaiBlueLinkApiBR(region=_BR_REGION, brand=_HYUNDAI_BRAND, language=language)
+        assert api.language == "en-US"
+        assert api.api_headers["Accept-Language"] == "en-US"
+
+    def test_defaults_to_english(self, br_api):
+        assert br_api.language == "en-US"
+        br_api.session = MagicMock()
+        br_api.session.post.return_value = _resp(200, {"redirectUrl": "https://example.com/?code=code"})
+        br_api._get_authorization_code({}, "user", "pass")
+        assert br_api.session.post.call_args.kwargs["headers"]["Accept-Language"] == "en-US"
+        assert br_api._get_authenticated_headers(_token())["Accept-Language"] == "en-US"
+        br_api.session.get.return_value = _resp(200, {})
+        br_api._get_cookies()
+        assert br_api.session.get.call_args.kwargs["headers"]["Accept-Language"] == "en-US"
+        br_api._get_auth_response("code")
+        assert br_api.session.post.call_args.kwargs["headers"]["Accept-Language"] == "en-US"
 
 
 class TestRaiseAuthError:
@@ -185,7 +205,7 @@ class TestDeviceRegistration:
         assert url.endswith("/api/v1/spa/notifications/register")
         assert request["headers"] == {
             "Accept": "application/json",
-            "Accept-Language": "pt-BR",
+            "Accept-Language": "en-US",
             "Content-Type": "application/json; charset=UTF-8",
             "User-Agent": "okhttp/4.12.0",
             "ccsp-service-id": "03f7df9b-7626-4853-b7bd-ad1e8d722bd5",
@@ -250,7 +270,7 @@ class TestDeviceRegistration:
 
         assert token.device_id == "registered-device"
         br_api._get_device_id.assert_called_once_with()
-        br_api.ensure_device_language.assert_called_once_with(token)
+        br_api.ensure_device_language.assert_not_called()
 
 
 class TestDeviceLanguage:
@@ -268,7 +288,7 @@ class TestDeviceLanguage:
         assert br_api.ensure_device_language(_token()) is False
         br_api.session.post.assert_not_called()
         request = br_api.session.get.call_args.kwargs
-        assert request["headers"]["Accept-Language"].startswith("pt-BR;")
+        assert request["headers"]["Accept-Language"] == "en-US"
         assert request["headers"]["ccsp-device-id"] == "registered-device"
 
     def test_updates_non_portuguese_device(self, br_api):
@@ -337,7 +357,8 @@ class TestDeviceLanguage:
         token = br_api.login("user@example.com", "password", pin="1234")
 
         assert token.device_id == "registered-device"
-        assert "language_sync_failed" in caplog.text
+        br_api.ensure_device_language.assert_not_called()
+        assert "language_sync_failed" not in caplog.text
         assert "secret" not in caplog.text
 
     @pytest.mark.parametrize(
@@ -371,18 +392,19 @@ class TestDeviceLanguage:
             ),
         ],
     )
-    def test_commands_fail_closed_before_control_token_or_vehicle_request(
+    def test_commands_preserve_language_and_still_require_control_token(
         self, br_api, command
     ):
         br_api.session = MagicMock()
         br_api.ensure_device_language = MagicMock(
             side_effect=APIError("device-language unavailable")
         )
-        br_api._ensure_control_token = MagicMock()
+        br_api._ensure_control_token = MagicMock(side_effect=AuthenticationError("control rejected"))
         vehicle = MagicMock(id="vehicle-id", ccu_ccs2_protocol_support=0)
 
-        with pytest.raises(APIError, match="device-language unavailable"):
+        with pytest.raises(AuthenticationError, match="control rejected"):
             command(br_api, _token(), vehicle)
 
-        br_api._ensure_control_token.assert_not_called()
+        br_api.ensure_device_language.assert_not_called()
+        br_api._ensure_control_token.assert_called_once()
         br_api.session.post.assert_not_called()

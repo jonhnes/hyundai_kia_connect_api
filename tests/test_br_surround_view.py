@@ -88,7 +88,7 @@ class TestBrazilianSurroundView:
         ):
             capture = api.capture_surround_view(token, vehicle)
 
-        assert order == ["language", "pin"]
+        assert order == ["pin"]
         assert capture.message_id == "message-id"
         assert capture.media_type == "image"
         assert capture.image == b"photo"
@@ -230,15 +230,16 @@ class TestBrazilianSurroundView:
         assert api.session.post.call_count == 1
         api.session.get.assert_not_called()
 
-    def test_language_failure_stops_before_pin_or_submission(self):
+    def test_capture_preserves_language_and_still_requires_pin(self):
         api = _api()
         api.ensure_device_language = MagicMock(side_effect=APIError("language unavailable"))
-        api._ensure_control_token = MagicMock()
+        api._ensure_control_token = MagicMock(side_effect=APIError("control unavailable"))
 
-        with pytest.raises(APIError, match="language unavailable"):
+        with pytest.raises(APIError, match="control unavailable"):
             api.capture_surround_view(_token(), _vehicle())
 
-        api._ensure_control_token.assert_not_called()
+        api.ensure_device_language.assert_not_called()
+        api._ensure_control_token.assert_called_once()
         api.session.post.assert_not_called()
 
     def test_timeout_does_not_submit_a_second_capture(self):
